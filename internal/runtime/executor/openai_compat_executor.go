@@ -122,6 +122,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	if err != nil {
 		return resp, err
 	}
+	translated = helps.RepairOpenAICompatReasoningContent(from.String(), baseURL, baseModel, originalPayload, translated)
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
@@ -140,6 +141,12 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 			translated = updated
 		}
 		translated = sanitizeOpenAIResponsesReasoningEncryptedContent(ctx, "openai compat executor", translated)
+	}
+	// Abort a model that is stuck re-issuing the same tool call with the same
+	// result. Return a non-retryable 422 so Claude Code stops instead of
+	// looping forever. Mirrors the streaming path guard.
+	if loopErr := e.abortToolCallLoop(ctx, baseURL, baseModel, translated); loopErr != nil {
+		return resp, loopErr
 	}
 	reporter.SetTranslatedReasoningEffort(translated, to.String())
 
@@ -336,6 +343,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	if err != nil {
 		return nil, err
 	}
+	translated = helps.RepairOpenAICompatReasoningContent(from.String(), baseURL, baseModel, originalPayload, translated)
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
@@ -348,6 +356,12 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		if err != nil {
 			return nil, err
 		}
+	}
+	// Abort a model that is stuck re-issuing the same tool call with the same
+	// result (e.g. repeatedly checking a directory that never changes). Return
+	// a non-retryable 422 so Claude Code stops instead of looping forever.
+	if loopErr := e.abortToolCallLoop(ctx, baseURL, baseModel, translated); loopErr != nil {
+		return nil, loopErr
 	}
 
 	// Request usage data in the final streaming chunk so that token statistics
@@ -426,6 +440,41 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		var streamAborted bool
 		var upstreamEvent string
 		var frameData [][]byte
+		// Track whether the upstream produced any actual content or tool calls.
+		// A reasoning vendor (e.g. DeepSeek) may close the stream having emitted
+		// only reasoning_content; the client would receive a "complete" message
+		// with no text and no tool call, stalling the conversation. When that
+		// happens we surface a retryable error so the client re-issues the
+		// request (see the terminal branch below).
+		var sawContent, sawToolCalls bool
+		// Stream diagnostics: summarize what the upstream actually emitted so a
+		// reasoning-only / mid-body truncation close can be characterized from
+		// the request log without dumping every chunk. A window of first/last
+		// per-chunk kinds (content / reasoning / tool_calls / finish:* / usage)
+		// plus a count lets us tell "empty EOF" apart from "thinking only" and
+		// from "body cut mid-sentence" (the 201754 class).
+		var sawReasoning bool
+		var nChunks int
+		const kindWindow = 8
+		var firstKinds, lastKinds []string
+		// recordKind records one delta-kind event (content / reasoning /
+		// tool_calls / finish:* / usage) into the first/last windows. A single
+		// chunk may carry several kinds (e.g. content + tool_calls), so nChunks
+		// is incremented per chunk in the scan loop, not here.
+		recordKind := func(kind string) {
+			if kind == "" {
+				kind = "(no-delta)"
+			}
+			if len(firstKinds) < kindWindow {
+				firstKinds = append(firstKinds, kind)
+			}
+			if len(lastKinds) < kindWindow {
+				lastKinds = append(lastKinds, kind)
+			} else {
+				copy(lastKinds, lastKinds[1:])
+				lastKinds[len(lastKinds)-1] = kind
+			}
+		}
 		defer streamUsage.Publish(ctx, reporter)
 
 		publishStreamError := func(streamErr statusErr, containsPayload bool) {
@@ -477,6 +526,39 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 				if streamErr, isError := openAICompatStreamDataError(dataPayload, eventName); isError {
 					publishStreamError(streamErr, true)
 					return true
+				}
+			}
+			// Track whether this frame carries real content or a tool call.
+			// reasoning_content-only frames must not count as output. Parse the
+			// choices[0] object once so each frame is scanned a single time.
+			// The delta fields are read from the joined dataPayload, matching the
+			// upstream framing: OpenAI-compatible streams put one JSON object per
+			// data line, and DeepSeek emits a single reasoning/content delta per
+			// frame.
+			if !isDone {
+				nChunks++
+				if choice := gjson.GetBytes(dataPayload, "choices.0"); choice.Exists() {
+					if delta := choice.Get("delta"); delta.Exists() {
+						if c := delta.Get("content"); c.Exists() && c.Type != gjson.Null && c.String() != "" {
+							sawContent = true
+							recordKind("content")
+						}
+						if r := delta.Get("reasoning_content"); r.Exists() && r.Type != gjson.Null && r.String() != "" {
+							sawReasoning = true
+							recordKind("reasoning")
+						}
+						if tc := delta.Get("tool_calls"); tc.IsArray() && len(tc.Array()) > 0 {
+							sawToolCalls = true
+							recordKind("tool_calls")
+						}
+					}
+					if fr := choice.Get("finish_reason"); fr.Exists() && fr.String() != "" {
+						recordKind("finish:" + fr.String())
+					}
+				} else if gjson.GetBytes(dataPayload, "usage").Exists() {
+					recordKind("usage")
+				} else {
+					recordKind("other")
 				}
 			}
 
@@ -532,13 +614,57 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		if streamFailed || streamAborted {
 			return
 		}
-		if errScan != nil {
-			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.PublishFailure(ctx, errScan)
+		// emitErr records a terminal stream error, publishes the failure and
+		// forwards it to the client exactly once.
+		emitErr := func(streamErr error) {
+			helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
+			reporter.PublishFailure(ctx, streamErr)
 			select {
-			case out <- cliproxyexecutor.StreamChunk{Err: errScan}:
+			case out <- cliproxyexecutor.StreamChunk{Err: streamErr}:
 			case <-ctx.Done():
 			}
+		}
+		reasoningOnly := !seenDone && helps.IsReasoningVendor(baseURL, baseModel) && !sawContent && !sawToolCalls
+		if errScan := scanner.Err(); errScan != nil {
+			// A stream read error that is NOT a client-side cancellation (ctx
+			// still live) and produced only reasoning with no content/tool call
+			// is the same truncated-response class as the no-[DONE] EOF case:
+			// surface a retryable error so the client re-issues the request.
+			// A real client cancel (ctx.Err() != nil) is passed through unchanged
+			// — the client already gave up, retrying is pointless.
+			if ctx.Err() == nil && reasoningOnly {
+				helps.LogWithRequestID(ctx).Debugf("openai compat executor: stream error after reasoning-only close (err=%v reasoning=%v content=%v tool_calls=%v chunks=%d first=%v last=%v)",
+					errScan, sawReasoning, sawContent, sawToolCalls, nChunks, firstKinds, lastKinds)
+				emitErr(statusErr{
+					code: http.StatusServiceUnavailable,
+					msg:  "upstream stream error after reasoning only (no content or tool call); retrying request",
+				})
+			} else {
+				emitErr(errScan)
+			}
+		} else if reasoningOnly {
+			// Reasoning vendors (DeepSeek) intermittently close the stream having
+			// emitted only reasoning_content: no content, no tool_calls, and no
+			// terminal [DONE]. Translated to the source format this looks like a
+			// complete message with a thinking block but no text and no tool call,
+			// which stalls the conversation. Surface a retryable upstream error
+			// instead so the client re-issues the request (Claude Code retries
+			// transient 5xx/stream interruptions automatically). Only for
+			// reasoning vendors — a genuinely empty response from a generic
+			// OpenAI-compatible backend is left untouched.
+			//
+			// Gate on !seenDone: a thinking-only stream that ended NORMALLY (the
+			// upstream emitted [DONE], e.g. the model chose to think without
+			// producing content or a tool call this turn, as happens when it
+			// echoes a placeholder reasoning) is a legal completed turn, not a
+			// truncation. Retrying it would surface a spurious error to the
+			// client; it is left to close cleanly below.
+			helps.LogWithRequestID(ctx).Debugf("openai compat executor: upstream closed with reasoning only (reasoning=%v content=%v tool_calls=%v chunks=%d first=%v last=%v)",
+				sawReasoning, sawContent, sawToolCalls, nChunks, firstKinds, lastKinds)
+			emitErr(statusErr{
+				code: http.StatusServiceUnavailable,
+				msg:  "upstream returned reasoning only (no content or tool call); retrying request",
+			})
 		} else if !seenDone {
 			// Responses clients require an explicit terminal event. Treat a clean
 			// upstream EOF without [DONE] as a failed stream instead of completing it.
@@ -554,6 +680,13 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 			}
 
 			// Other protocols retain compatibility with providers that omit [DONE].
+			// Log the stream profile so the mid-body truncation class (content
+			// emitted then stream died with no finish_reason / usage / [DONE]) can
+			// be distinguished from a clean close.
+			helps.LogWithRequestID(ctx).Debugf("openai compat executor: upstream closed without [DONE] (reasoning=%v content=%v tool_calls=%v chunks=%d first=%v last=%v)",
+				sawReasoning, sawContent, sawToolCalls, nChunks, firstKinds, lastKinds)
+			// Feed a synthetic done marker through the translator so pending
+			// response.completed events are still emitted exactly once.
 			chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, opts.OriginalRequest, translated, []byte("data: [DONE]"), &param, claudeInputTokens)
 			for i := range chunks {
 				select {
@@ -568,6 +701,19 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		reporter.EnsurePublished(ctx)
 	}()
 	return &cliproxyexecutor.StreamResult{Headers: httpResp.Header.Clone(), Chunks: out}, nil
+}
+
+// abortToolCallLoop reports whether the translated payload contains a tool-call
+// loop, returning a non-retryable 422 error when it does. Shared by Execute and
+// ExecuteStream so both the non-streaming and streaming paths abort a model that
+// re-issues the same tool call with the same result.
+func (e *OpenAICompatExecutor) abortToolCallLoop(ctx context.Context, baseURL, baseModel string, translated []byte) error {
+	if !helps.IsReasoningVendor(baseURL, baseModel) || !helps.DetectOpenAIToolCallLoop(translated) {
+		return nil
+	}
+	loopErr := statusErr{code: http.StatusUnprocessableEntity, msg: helps.ToolCallLoopErrorMsg}
+	helps.LogWithRequestID(ctx).Warnf("openai compat executor: %s (model=%s)", helps.ToolCallLoopErrorMsg, baseModel)
+	return loopErr
 }
 
 func (e *OpenAICompatExecutor) executeImagesStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, endpointPath string) (_ *cliproxyexecutor.StreamResult, err error) {
