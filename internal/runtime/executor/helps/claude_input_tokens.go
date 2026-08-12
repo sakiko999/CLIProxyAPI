@@ -29,6 +29,7 @@ type ClaudeInputTokenState struct {
 	originalRequest []byte
 	codec           tokenizer.Codec
 	handled         bool
+	echoFilter      placeholderEchoFilter
 }
 
 // NewClaudeInputTokenState creates request-scoped state for translated Claude input token usage.
@@ -69,9 +70,106 @@ func TranslateStreamWithClaudeInputTokens(
 		}
 	}
 	if state == nil {
+		// No stream state (e.g. a non-Claude response path): still drop the
+		// placeholder echo, but without cross-batch buffering.
+		var oneOff placeholderEchoFilter
+		return oneOff.filter(chunks, model)
+	}
+	chunks = state.echoFilter.filter(chunks, model)
+	return state.apply(ctx, chunks)
+}
+
+// filterReasoningUnavailableEcho drops SSE chunks of a thinking block whose
+// only text is the reasoning placeholder. A reasoning vendor (DeepSeek) that
+// received the placeholder as assistant reasoning echoes it back verbatim as
+// its own thinking; written to the client session that would accumulate one
+// placeholder thinking block per tool turn and feed the pollution loop. The
+// filter matches the placeholder exactly, so genuine thinking is never dropped.
+// Only the OpenAI -> Claude translation path is filtered: non-reasoning vendors
+// never receive the placeholder (the request-side repair gates on the vendor
+// whitelist).
+//
+// The filter is stateful across stream batches: the content_block_start of a
+// thinking block is buffered until its first delta arrives, so an all-placeholder
+// block (start + placeholder delta + stop) is dropped as a whole instead of
+// leaving an empty thinking block behind.
+type placeholderEchoFilter struct {
+	pendingStart []byte
+}
+
+func (f *placeholderEchoFilter) filter(chunks [][]byte, model string) [][]byte {
+	if len(chunks) == 0 || !IsReasoningVendor("", model) {
 		return chunks
 	}
-	return state.apply(ctx, chunks)
+	out := make([][]byte, 0, len(chunks))
+	for _, chunk := range chunks {
+		evt, blockType, deltaType, thinking := sseThinkingEvent(chunk)
+		switch {
+		case evt == "content_block_start" && blockType == "thinking":
+			f.pendingStart = append(f.pendingStart[:0], chunk...)
+			continue
+		case evt == "content_block_delta" && deltaType == "thinking_delta":
+			if IsReasoningUnavailable(thinking) {
+				continue
+			}
+			if f.pendingStart != nil {
+				out = append(out, f.pendingStart)
+				f.pendingStart = nil
+			}
+			out = append(out, chunk)
+			continue
+		case evt == "content_block_stop" && f.pendingStart != nil:
+			// The buffered start never received a real delta: the whole block
+			// is an empty-thinking placeholder echo. Drop the stop and the start.
+			f.pendingStart = nil
+			continue
+		}
+		if f.pendingStart != nil {
+			// A non-thinking event interrupted the buffered block (unusual);
+			// flush the start rather than dropping it.
+			out = append(out, f.pendingStart)
+			f.pendingStart = nil
+		}
+		out = append(out, chunk)
+	}
+	return out
+}
+
+// sseThinkingEvent extracts the fields needed by the echo filter from a Claude
+// SSE chunk: the event type, content block type, delta type and thinking text.
+// Empty strings are returned for fields the chunk does not carry. The chunk is
+// scanned in place (no full-copy string split); the first data: line carries
+// the single JSON object, which is parsed via gjson.GetBytes.
+func sseThinkingEvent(chunk []byte) (eventType, blockType, deltaType, thinking string) {
+	rest := chunk
+	for len(rest) > 0 {
+		newline := bytes.IndexByte(rest, '\n')
+		var line []byte
+		if newline < 0 {
+			line = rest
+			rest = nil
+		} else {
+			line = rest[:newline]
+			rest = rest[newline+1:]
+		}
+		trimmed := bytes.TrimSpace(line)
+		if !bytes.HasPrefix(trimmed, []byte("data:")) {
+			continue
+		}
+		payload := bytes.TrimSpace(trimmed[len("data:"):])
+		eventType = gjson.GetBytes(payload, "type").String()
+		switch eventType {
+		case "content_block_start":
+			blockType = gjson.GetBytes(payload, "content_block.type").String()
+		case "content_block_delta":
+			deltaType = gjson.GetBytes(payload, "delta.type").String()
+			if deltaType == "thinking_delta" {
+				thinking = gjson.GetBytes(payload, "delta.thinking").String()
+			}
+		}
+		return eventType, blockType, deltaType, thinking
+	}
+	return "", "", "", ""
 }
 
 func claudeInputTokenizer() (tokenizer.Codec, error) {

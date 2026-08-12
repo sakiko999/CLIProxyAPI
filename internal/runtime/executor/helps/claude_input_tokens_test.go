@@ -441,3 +441,63 @@ func joinClaudeInputChunks(chunks [][]byte) string {
 	}
 	return builder.String()
 }
+
+// --- Placeholder echo filtering (B4) ---
+
+func TestPlaceholderEchoFilterDropsWholePlaceholderBlock(t *testing.T) {
+	chunks := [][]byte{
+		[]byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`),
+		[]byte(`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"[reasoning unavailable]"}}`),
+		[]byte(`data: {"type":"content_block_stop","index":0}`),
+	}
+	var filter placeholderEchoFilter
+	got := filter.filter(chunks, "deepseek-v4-flash")
+	if len(got) != 0 {
+		t.Fatalf("filtered chunks = %d, want 0 (whole placeholder block dropped); got %q", len(got), joinClaudeInputChunks(got))
+	}
+}
+
+func TestPlaceholderEchoFilterKeepsRealThinking(t *testing.T) {
+	chunks := [][]byte{
+		[]byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`),
+		[]byte(`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"I should call the tool."}}`),
+		[]byte(`data: {"type":"content_block_stop","index":0}`),
+	}
+	var filter placeholderEchoFilter
+	got := filter.filter(chunks, "deepseek-v4-flash")
+	if len(got) != 3 {
+		t.Fatalf("filtered chunks = %d, want 3 (real thinking preserved); got %q", len(got), joinClaudeInputChunks(got))
+	}
+}
+
+func TestPlaceholderEchoFilterSkipsNonVendor(t *testing.T) {
+	chunks := [][]byte{
+		[]byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`),
+		[]byte(`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"[reasoning unavailable]"}}`),
+		[]byte(`data: {"type":"content_block_stop","index":0}`),
+	}
+	var filter placeholderEchoFilter
+	got := filter.filter(chunks, "claude-sonnet-4.6")
+	if len(got) != 3 {
+		t.Fatalf("filtered chunks = %d, want 3 (non-vendor untouched); got %q", len(got), joinClaudeInputChunks(got))
+	}
+}
+
+func TestPlaceholderEchoFilterDropsAcrossBatches(t *testing.T) {
+	var filter placeholderEchoFilter
+	// Batch 1: only the thinking block start.
+	gotFirst := filter.filter([][]byte{
+		[]byte(`data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`),
+	}, "deepseek-v4-flash")
+	if len(gotFirst) != 0 {
+		t.Fatalf("first batch filtered chunks = %d, want 0 (start buffered); got %q", len(gotFirst), joinClaudeInputChunks(gotFirst))
+	}
+	// Batch 2: placeholder delta + stop close the empty block.
+	gotSecond := filter.filter([][]byte{
+		[]byte(`data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"[reasoning unavailable]"}}`),
+		[]byte(`data: {"type":"content_block_stop","index":0}`),
+	}, "deepseek-v4-flash")
+	if len(gotSecond) != 0 {
+		t.Fatalf("second batch filtered chunks = %d, want 0 (whole block dropped); got %q", len(gotSecond), joinClaudeInputChunks(gotSecond))
+	}
+}
